@@ -14,7 +14,7 @@ pub fn rest_of<'a, I: Iterator<Item = &'a str>>(items: I) -> Result<String> {
     let txt: Vec<_> = items.collect();
     let txt = txt.join(" ");
     if txt.is_empty() {
-        Err(Error::msg(format!("Empty value")))
+        Err(Error::msg("Empty value".to_string()))
     } else {
         Ok(txt)
     }

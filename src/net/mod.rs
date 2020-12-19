@@ -1,8 +1,11 @@
+use crate::{error, utils};
+use error::*;
 use libp2p::{
     gossipsub::{
         Gossipsub, GossipsubConfigBuilder, GossipsubEvent, MessageAuthenticity, MessageId, Topic,
         ValidationMode,
     },
+    identify::{Identify, IdentifyEvent},
     identity::Keypair,
     kad::{
         kbucket, record::store::MemoryStore, record::Key, store::RecordStore, AddProviderOk,
@@ -14,8 +17,6 @@ use libp2p::{
     swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent},
     NetworkBehaviour, PeerId,
 };
-use utils::*;
-use error::*;
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
     convert::TryInto,
@@ -24,8 +25,8 @@ use std::{
     hash::Hasher,
     time::Duration,
 };
-use crate::{error, utils};
 pub use transport::build_transport;
+use utils::*;
 
 pub mod transport;
 
@@ -43,6 +44,23 @@ pub struct OurNetwork {
     my_id: PeerId,
     #[behaviour(ignore)]
     kad_boostrap_started: bool,
+    identify: Identify,
+}
+
+impl NetworkBehaviourEventProcess<IdentifyEvent> for OurNetwork {
+    fn inject_event(&mut self, evt: IdentifyEvent) {
+        if let IdentifyEvent::Received {
+            peer_id,
+            info,
+            observed_addr,
+        } = evt
+        {
+            debug!(
+                "Identified peer {} info {:?}, it sees us on addr {}",
+                peer_id, info, observed_addr
+            );
+        }
+    }
 }
 
 impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
@@ -279,7 +297,11 @@ impl OurNetwork {
                 let key = Key::new(&key_value);
                 let providers = self.kad.store_mut().providers(&key);
                 debug!("Locally known providers {:?}", providers);
-                if let Some(_) = providers.iter().find(|r| r.provider == self.my_id) {
+                if providers
+                    .iter()
+                    .find(|r| r.provider == self.my_id)
+                    .is_some()
+                {
                     println!("Key {} is provided locally", key_value);
                 } else {
                     self.kad.get_providers(key);
@@ -333,37 +355,42 @@ MY_ID\
         Ok(())
     }
 
-    pub async fn new(my_id: PeerId, key: Keypair, topic:String) -> Result<Self> {
+    pub async fn new(my_id: PeerId, key: Keypair, topic: String) -> Result<Self> {
         let topic = Topic::new(topic);
-    let cfg = GossipsubConfigBuilder::new()
-        .message_id_fn(|msg| {
-            let mut hasher = DefaultHasher::new();
-            msg.data.hash(&mut hasher);
-            MessageId::from(hasher.finish().to_string())
-        })
-        .validation_mode(ValidationMode::Strict)
-        .build();
+        let cfg = GossipsubConfigBuilder::new()
+            .message_id_fn(|msg| {
+                let mut hasher = DefaultHasher::new();
+                msg.data.hash(&mut hasher);
+                MessageId::from(hasher.finish().to_string())
+            })
+            .validation_mode(ValidationMode::Strict)
+            .build();
 
-    let mut pubsub = Gossipsub::new(MessageAuthenticity::Signed(key), cfg);
-    pubsub.subscribe(topic.clone());
+        let mut pubsub = Gossipsub::new(MessageAuthenticity::Signed(key.clone()), cfg);
+        pubsub.subscribe(topic.clone());
 
-    let kad = Kademlia::new(my_id.clone(), MemoryStore::new(my_id.clone()));
+        let kad = Kademlia::new(my_id.clone(), MemoryStore::new(my_id.clone()));
 
-    let behaviour = OurNetwork {
-        topics: pubsub,
-        topic,
-        dns: Mdns::new().await?,
-        peers: HashSet::new(),
-        ping: Ping::new(
-            PingConfig::new()
-                .with_interval(Duration::from_secs(5))
-                .with_max_failures(3.try_into().unwrap())
-                .with_keep_alive(true),
-        ),
-        kad,
-        kad_boostrap_started: false,
-        my_id: my_id.clone(),
-    };
-    Ok(behaviour)
+        let behaviour = OurNetwork {
+            topics: pubsub,
+            topic,
+            dns: Mdns::new().await?,
+            peers: HashSet::new(),
+            ping: Ping::new(
+                PingConfig::new()
+                    .with_interval(Duration::from_secs(5))
+                    .with_max_failures(3.try_into().unwrap())
+                    .with_keep_alive(true),
+            ),
+            kad,
+            kad_boostrap_started: false,
+            my_id: my_id.clone(),
+            identify: Identify::new(
+                "ipfs/1.0.0".into(),
+                env!("CARGO_PKG_NAME").to_string() + "/" + env!("CARGO_PKG_VERSION"),
+                key.public(),
+            ),
+        };
+        Ok(behaviour)
     }
 }

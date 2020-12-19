@@ -1,33 +1,24 @@
-
 #[macro_use]
 extern crate log;
 
-use libp2p::{
-    core::connection::ConnectionLimits,
-    identity::Keypair,
-    swarm::SwarmBuilder,
-    Swarm,
-};
+use libp2p::{core::connection::ConnectionLimits, identity::Keypair, swarm::SwarmBuilder, Swarm};
 
-use std::{
-    time::Duration,
-};
-use error::Result;
 use args::Args;
+use error::Result;
+use net::{build_transport, OurNetwork};
+use std::time::Duration;
 use tokio::{
     io::{self, AsyncBufReadExt, BufReader},
     stream::StreamExt,
 };
-use net::{OurNetwork, build_transport};
 
-mod utils;
-mod error;
 mod args;
+mod error;
 mod net;
+mod utils;
 
 const ADDR: &str = "/ip4/127.0.0.1/tcp/0";
 const TIMEOUT_SECS: u64 = 20;
-
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -1,7 +1,11 @@
 use std::time::Duration;
 
-use libp2p::{PeerId, Transport, core::{muxing::StreamMuxerBox, transport::Boxed, upgrade}, identity::Keypair, noise, tcp, yamux};
 use error::Result;
+use libp2p::{
+    core::{muxing::StreamMuxerBox, transport::Boxed, upgrade},
+    identity::Keypair,
+    noise, tcp, yamux, PeerId, Transport,
+};
 
 use crate::error;
 
@@ -19,5 +23,4 @@ pub fn build_transport(key: Keypair, timeout: Duration) -> Result<Boxed<(PeerId,
         .boxed();
 
     Ok(proto)
-
 }
