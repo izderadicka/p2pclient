@@ -1,7 +1,8 @@
 #[macro_use]
 extern crate log;
 
-use libp2p::{core::connection::ConnectionLimits, identity::Keypair, swarm::SwarmBuilder, Swarm};
+use libp2p::{PeerId, Swarm, swarm::NetworkBehaviour, core::connection::ConnectionLimits, identity::Keypair, 
+    swarm::SwarmBuilder};
 
 use args::Args;
 use error::Result;
@@ -11,6 +12,7 @@ use tokio::{
     io::{self, AsyncBufReadExt, BufReader},
     stream::StreamExt,
 };
+use utils::*;
 
 mod args;
 mod error;
@@ -19,6 +21,81 @@ mod utils;
 
 const ADDR: &str = "/ip4/127.0.0.1/tcp/0";
 const TIMEOUT_SECS: u64 = 20;
+
+fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String) -> Result<()> {
+    let mut items = line.split(' ').filter(|s| !s.is_empty());
+
+    let cmd = next_item(&mut items, "command")?.to_ascii_uppercase();
+    match cmd.as_str() {
+        "PUT" => {
+            let key = next_item(&mut items, "key")?;
+            let value = rest_of(items)?;
+            swarm.put_record(key, value)?;
+        }
+        "GET" => {
+            swarm.get_record (next_item(&mut items, "key")?);
+        }
+        "SEND"|"SAY" => {
+            swarm.publish(rest_of(items)?)?;
+        }
+
+        "PROVIDE" => {
+            let key = next_item(&mut items, "key")?;
+            swarm.start_providing(key)?;
+        }
+        "STOP_PROVIDE" => {
+            let key = next_item(&mut items, "key")?;
+            swarm.stop_providing(key);
+        }
+        "GET_PROVIDERS" => {
+            let key = next_item(&mut items, "key")?;
+            if ! swarm.get_providers(key) {
+                println!("Key {} is provided locally", key);
+            }
+        }
+        "GET_PEERS" => {
+            let key = next_item(&mut items, "key or peer_id")?;
+                swarm.get_closest_peers(key);
+        
+        }
+        "BUCKETS" => {
+            for b in swarm.buckets() {
+                let (start, end) = b.range();
+                let start = start.ilog2().unwrap_or(0);
+                let end = end.ilog2().unwrap_or(0);
+                println!("({:X} - {:X}) => {}", start, end, b.num_entries())
+            }
+        }
+        "ADDR" => {
+            let peer: PeerId = next_item(&mut items, "peer_id")?.parse()?;
+            let addrs = swarm.addresses_of_peer(&peer);
+            println!(
+                "Peer {} is known to have these addresses {}",
+                peer,
+                addrs.printable_list()
+            );
+        }
+        "MY_ID" => {
+            println!("My ID is {}", Swarm::local_peer_id(&swarm))
+        }
+        "HELP" => println!(
+            "\
+PUT <KEY> <VALUE>
+GET <KEY>
+SEND <MESSAGE>
+PROVIDE <KEY>
+STOP_PROVIDE <KEY>
+GET_PROVIDERS <KEY>
+GET_PEERS <KEY or PEER_ID>
+BUCKETS
+MY_ID\
+        "
+        ),
+        _ => error!("Invalid command {}", cmd),
+    }
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,10 +107,10 @@ async fn main() -> Result<()> {
     println!("My id is {}", my_id.to_base58());
     info!("My id is {}", my_id.to_base58());
 
-    let proto = build_transport(key.clone(), Duration::from_secs(TIMEOUT_SECS))?;
-    let behaviour = OurNetwork::new(my_id.clone(), key, "test_chat".into()).await?;
+    let transport = build_transport(key.clone(), Duration::from_secs(TIMEOUT_SECS))?;
+    let net = OurNetwork::new(my_id.clone(), key, "test_chat".into()).await?;
 
-    let mut swarm = SwarmBuilder::new(proto, behaviour, my_id)
+    let mut swarm = SwarmBuilder::new(transport, net, my_id)
         .executor(Box::new(|f| {
             tokio::spawn(f);
         }))
@@ -61,7 +138,7 @@ async fn main() -> Result<()> {
                     match line {
                         Some(Ok(line)) => {
 
-                            swarm.handle_input(line).unwrap_or_else(|e| error!("Input error: {}", e));
+                            handle_input(&mut swarm, line).unwrap_or_else(|e| error!("Input error: {}", e));
                         },
                         None => {
                             debug!("End of stdin");

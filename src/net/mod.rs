@@ -1,22 +1,9 @@
 use crate::{error, utils};
 use error::*;
-use libp2p::{
-    gossipsub::{
+use libp2p::{NetworkBehaviour, PeerId, gossipsub::{
         Gossipsub, GossipsubConfigBuilder, GossipsubEvent, MessageAuthenticity, MessageId, Topic,
         ValidationMode,
-    },
-    identify::{Identify, IdentifyEvent},
-    identity::Keypair,
-    kad::{
-        kbucket, record::store::MemoryStore, record::Key, store::RecordStore, AddProviderOk,
-        Kademlia, KademliaEvent, PeerRecord, PutRecordOk, QueryResult, Quorum, Record,
-    },
-    mdns::{Mdns, MdnsEvent},
-    ping::PingConfig,
-    ping::{Ping, PingEvent},
-    swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent},
-    NetworkBehaviour, PeerId,
-};
+    }, identify::{Identify, IdentifyEvent}, identity::Keypair, kad::{AddProviderOk, Addresses, Kademlia, KademliaEvent, PeerRecord, PutRecordOk, QueryResult, Quorum, Record, kbucket, record::Key, record::store::MemoryStore, store::RecordStore}, mdns::{Mdns, MdnsEvent}, ping::PingConfig, ping::{Ping, PingEvent}, swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent}};
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
     convert::TryInto,
@@ -32,19 +19,23 @@ pub mod transport;
 
 #[derive(NetworkBehaviour)]
 pub struct OurNetwork {
-    topics: Gossipsub,
-    #[behaviour(ignore)]
-    topic: Topic,
+    // Network Behaviours used
+    pubsub: Gossipsub,
     dns: Mdns,
     kad: Kademlia<MemoryStore>,
     ping: Ping,
+    identify: Identify,
+
+    // other properties
+    #[behaviour(ignore)]
+    topic: Topic,
     #[behaviour(ignore)]
     peers: HashSet<PeerId>,
     #[behaviour(ignore)]
     my_id: PeerId,
     #[behaviour(ignore)]
     kad_boostrap_started: bool,
-    identify: Identify,
+    
 }
 
 impl NetworkBehaviourEventProcess<IdentifyEvent> for OurNetwork {
@@ -254,107 +245,6 @@ impl OurNetwork {
         }
     }
 
-    pub fn handle_input(&mut self, line: String) -> Result<()> {
-        let mut items = line.split(' ').filter(|s| !s.is_empty());
-
-        let cmd = next_item(&mut items, "command")?.to_ascii_uppercase();
-        match cmd.as_str() {
-            "PUT" => {
-                let key = next_item(&mut items, "key")?;
-                let value = rest_of(items)?;
-                let record = Record {
-                    key: Key::new(&key),
-                    value: value.into(),
-                    publisher: None,
-                    expires: None,
-                };
-                self.kad
-                    .put_record(record, Quorum::One)
-                    .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
-            }
-            "GET" => {
-                let key = Key::new(&next_item(&mut items, "key")?);
-                self.kad.get_record(&key, Quorum::One);
-            }
-            "SEND" => {
-                self.topics
-                    .publish(&self.topic, rest_of(items)?)
-                    .map_err(|e| Error::msg(format!("Publish error{:?}", e)))?;
-            }
-
-            "PROVIDE" => {
-                let key = Key::new(&next_item(&mut items, "key")?);
-                self.kad
-                    .start_providing(key)
-                    .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
-            }
-            "STOP_PROVIDE" => {
-                let key = Key::new(&next_item(&mut items, "key")?);
-                self.kad.stop_providing(&key);
-            }
-            "GET_PROVIDERS" => {
-                let key_value = next_item(&mut items, "key")?;
-                let key = Key::new(&key_value);
-                let providers = self.kad.store_mut().providers(&key);
-                debug!("Locally known providers {:?}", providers);
-                if providers
-                    .iter()
-                    .find(|r| r.provider == self.my_id)
-                    .is_some()
-                {
-                    println!("Key {} is provided locally", key_value);
-                } else {
-                    self.kad.get_providers(key);
-                }
-            }
-            "GET_PEERS" => {
-                let key = next_item(&mut items, "key or peer_id")?;
-                if key.starts_with("12D3KooW") {
-                    let peer: PeerId = key.parse()?;
-                    self.kad.get_closest_peers(peer);
-                } else {
-                    self.kad.get_closest_peers(key.as_bytes());
-                };
-            }
-            "BUCKETS" => {
-                for b in self.kad.kbuckets() {
-                    let (start, end) = b.range();
-                    let start = start.ilog2().unwrap_or(0);
-                    let end = end.ilog2().unwrap_or(0);
-                    println!("({:X} - {:X}) => {}", start, end, b.num_entries())
-                }
-            }
-            "ADDR" => {
-                let peer: PeerId = next_item(&mut items, "peer_id")?.parse()?;
-                let addrs = self.addresses_of_peer(&peer);
-                println!(
-                    "Peer {} is known to have these addresses {}",
-                    peer,
-                    addrs.printable_list()
-                );
-            }
-            "MY_ID" => {
-                println!("My ID is {}", self.my_id)
-            }
-            "HELP" => println!(
-                "\
-PUT <KEY> <VALUE>
-GET <KEY>
-SEND <MESSAGE>
-PROVIDE <KEY>
-STOP_PROVIDE <KEY>
-GET_PROVIDERS <KEY>
-GET_PEERS <KEY or PEER_ID>
-BUCKETS
-MY_ID\
-            "
-            ),
-            _ => error!("Invalid command {}", cmd),
-        }
-
-        Ok(())
-    }
-
     pub async fn new(my_id: PeerId, key: Keypair, topic: String) -> Result<Self> {
         let topic = Topic::new(topic);
         let cfg = GossipsubConfigBuilder::new()
@@ -372,7 +262,7 @@ MY_ID\
         let kad = Kademlia::new(my_id.clone(), MemoryStore::new(my_id.clone()));
 
         let behaviour = OurNetwork {
-            topics: pubsub,
+            pubsub,
             topic,
             dns: Mdns::new().await?,
             peers: HashSet::new(),
@@ -392,5 +282,96 @@ MY_ID\
             ),
         };
         Ok(behaviour)
+    }
+
+    //usage methods for convenience
+
+    pub fn put_record<K,V>(&mut self, key:K, value:V) -> Result<()> 
+    where K:AsRef<[u8]>,
+        V: Into<Vec<u8>>
+
+    {
+        let record = Record {
+            key: Key::new(&key),
+            value: value.into(),
+            publisher: None,
+            expires: None,
+        };
+        self.kad
+            .put_record(record, Quorum::One)
+            .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
+
+        Ok(())
+    }
+
+    pub fn get_record<K>(&mut self, key:K) 
+    where K: AsRef<[u8]>
+    {
+        let key = Key::new(&key);
+        self.kad.get_record(&key, Quorum::One);
+        
+    }
+
+    pub fn publish<T>(&mut self, msg: T) -> Result<()> 
+    where T: Into<Vec<u8>>
+    {
+        self.pubsub
+                .publish(&self.topic, msg)
+                .map_err(|e| Error::msg(format!("Publish error{:?}", e)))
+    }
+
+    pub fn start_providing<K>(&mut self, key:K) -> Result<()>
+    where K: AsRef<[u8]> 
+    {
+        let key = Key::new(&key);
+            self.kad
+                .start_providing(key)
+                .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
+
+        Ok(())
+    }
+
+    pub fn stop_providing<K>(&mut self, key:K) 
+    where K: AsRef<[u8]> 
+    {
+        let key = Key::new(&key);
+            self.kad
+                .stop_providing(&key);
+
+    }
+
+    pub fn get_providers<K>(&mut self, key:K) -> bool 
+    where K: AsRef<[u8]> 
+    {
+        let key = Key::new(&key);
+        let providers = self.kad.store_mut().providers(&key);
+        debug!("Locally known providers {:?}", providers);
+        if providers
+            .iter()
+            .find(|r| r.provider == self.my_id)
+            .is_some()
+        {
+            false
+        } else {
+            self.kad.get_providers(key);
+            true
+        }
+    }
+
+    pub fn get_closest_peers<K>(&mut self, key:K) 
+    where K: AsRef<[u8]>
+    {   
+        if let Ok(peer) =  std::str::from_utf8(key.as_ref())
+        .map_err(|_| ())
+        .and_then(|s| s.parse::<PeerId>().map_err(|_| ())) {
+           self.kad.get_closest_peers(peer)
+        } else {
+            self.kad.get_closest_peers(key.as_ref())
+        }; 
+        
+    }
+
+    pub fn buckets(&mut self) -> impl Iterator<Item = kbucket::KBucketRef<'_, kbucket::Key<PeerId>, Addresses>>{
+        self.kad.kbuckets()
     }
 }
