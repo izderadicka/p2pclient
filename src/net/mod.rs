@@ -3,18 +3,24 @@ use error::*;
 use libp2p::{NetworkBehaviour, PeerId, gossipsub::{
         Gossipsub, GossipsubConfigBuilder, GossipsubEvent, MessageAuthenticity, MessageId, Topic,
         ValidationMode,
-    }, identify::{Identify, IdentifyEvent}, identity::Keypair, kad::{AddProviderOk, Addresses, Kademlia, KademliaEvent, PeerRecord, PutRecordOk, QueryResult, Quorum, Record, kbucket, record::Key, record::store::MemoryStore, store::RecordStore}, mdns::{Mdns, MdnsEvent}, ping::PingConfig, ping::{Ping, PingEvent}, swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent}};
+    }, identify::{Identify, IdentifyEvent}, identity::Keypair, kad::{
+        kbucket, record::store::MemoryStore, record::Key, store::RecordStore, AddProviderOk,
+        Addresses, Kademlia, KademliaEvent, PeerRecord, PutRecordOk, QueryResult, Quorum, Record,
+    }, mdns::{Mdns, MdnsEvent}, ping::PingConfig, ping::{Ping, PingEvent}, request_response::{ProtocolSupport, RequestResponse, RequestResponseConfig, RequestResponseEvent, RequestResponseMessage}, swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent}};
+use proto::ProtocolCodec;
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
     convert::TryInto,
     fmt::Debug,
     hash::Hash,
     hash::Hasher,
+    iter::once,
     time::Duration,
 };
 pub use transport::build_transport;
 use utils::*;
 
+pub mod proto;
 pub mod transport;
 
 #[derive(NetworkBehaviour)]
@@ -25,6 +31,7 @@ pub struct OurNetwork {
     kad: Kademlia<MemoryStore>,
     ping: Ping,
     identify: Identify,
+    rpc: RequestResponse<ProtocolCodec>,
 
     // other properties
     #[behaviour(ignore)]
@@ -35,7 +42,29 @@ pub struct OurNetwork {
     my_id: PeerId,
     #[behaviour(ignore)]
     kad_boostrap_started: bool,
-    
+}
+
+impl NetworkBehaviourEventProcess<RequestResponseEvent<String, String>> for OurNetwork {
+    fn inject_event(&mut self, evt: RequestResponseEvent<String, String>) {
+        if let RequestResponseEvent::Message{message, peer} = evt {
+            match message {
+                RequestResponseMessage::Response{response, request_id} =>  
+                    println!("Got response message id {} from {}: {}", request_id, peer, response), 
+
+                RequestResponseMessage::Request{request_id, request, channel} => {
+                    debug!("Got request message id {} from {}: {}", request_id, peer, request);
+                    let reply = "Confirm ".to_string() + &request;
+                    self.rpc.send_response(channel, reply).unwrap_or_else(|e| error!("Error sending reply {}", e));
+                }
+
+            }
+
+           
+
+        } else {
+            debug!("RPC event {:?}", evt)
+        }
+    }
 }
 
 impl NetworkBehaviourEventProcess<IdentifyEvent> for OurNetwork {
@@ -273,6 +302,11 @@ impl OurNetwork {
                     .with_keep_alive(true),
             ),
             kad,
+            rpc: RequestResponse::new(
+                ProtocolCodec,
+                once((proto::PROTOCOL_NAME.to_string(), ProtocolSupport::Full)),
+                RequestResponseConfig::default(),
+            ),
             kad_boostrap_started: false,
             my_id: my_id.clone(),
             identify: Identify::new(
@@ -286,10 +320,10 @@ impl OurNetwork {
 
     //usage methods for convenience
 
-    pub fn put_record<K,V>(&mut self, key:K, value:V) -> Result<()> 
-    where K:AsRef<[u8]>,
-        V: Into<Vec<u8>>
-
+    pub fn put_record<K, V>(&mut self, key: K, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: Into<Vec<u8>>,
     {
         let record = Record {
             key: Key::new(&key),
@@ -304,44 +338,46 @@ impl OurNetwork {
         Ok(())
     }
 
-    pub fn get_record<K>(&mut self, key:K) 
-    where K: AsRef<[u8]>
+    pub fn get_record<K>(&mut self, key: K)
+    where
+        K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
         self.kad.get_record(&key, Quorum::One);
-        
     }
 
-    pub fn publish<T>(&mut self, msg: T) -> Result<()> 
-    where T: Into<Vec<u8>>
+    pub fn publish<T>(&mut self, msg: T) -> Result<()>
+    where
+        T: Into<Vec<u8>>,
     {
         self.pubsub
-                .publish(&self.topic, msg)
-                .map_err(|e| Error::msg(format!("Publish error{:?}", e)))
+            .publish(&self.topic, msg)
+            .map_err(|e| Error::msg(format!("Publish error{:?}", e)))
     }
 
-    pub fn start_providing<K>(&mut self, key:K) -> Result<()>
-    where K: AsRef<[u8]> 
+    pub fn start_providing<K>(&mut self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
-            self.kad
-                .start_providing(key)
-                .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
+        self.kad
+            .start_providing(key)
+            .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
 
         Ok(())
     }
 
-    pub fn stop_providing<K>(&mut self, key:K) 
-    where K: AsRef<[u8]> 
+    pub fn stop_providing<K>(&mut self, key: K)
+    where
+        K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
-            self.kad
-                .stop_providing(&key);
-
+        self.kad.stop_providing(&key);
     }
 
-    pub fn get_providers<K>(&mut self, key:K) -> bool 
-    where K: AsRef<[u8]> 
+    pub fn get_providers<K>(&mut self, key: K) -> bool
+    where
+        K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
         let providers = self.kad.store_mut().providers(&key);
@@ -358,20 +394,28 @@ impl OurNetwork {
         }
     }
 
-    pub fn get_closest_peers<K>(&mut self, key:K) 
-    where K: AsRef<[u8]>
-    {   
-        if let Ok(peer) =  std::str::from_utf8(key.as_ref())
-        .map_err(|_| ())
-        .and_then(|s| s.parse::<PeerId>().map_err(|_| ())) {
-           self.kad.get_closest_peers(peer)
+    pub fn get_closest_peers<K>(&mut self, key: K)
+    where
+        K: AsRef<[u8]>,
+    {
+        if let Ok(peer) = std::str::from_utf8(key.as_ref())
+            .map_err(|_| ())
+            .and_then(|s| s.parse::<PeerId>().map_err(|_| ()))
+        {
+            self.kad.get_closest_peers(peer)
         } else {
             self.kad.get_closest_peers(key.as_ref())
-        }; 
-        
+        };
     }
 
-    pub fn buckets(&mut self) -> impl Iterator<Item = kbucket::KBucketRef<'_, kbucket::Key<PeerId>, Addresses>>{
+    pub fn buckets(
+        &mut self,
+    ) -> impl Iterator<Item = kbucket::KBucketRef<'_, kbucket::Key<PeerId>, Addresses>> {
         self.kad.kbuckets()
+    }
+
+    pub fn send_message(&mut self, peer: PeerId, message: String) {
+        let id = self.rpc.send_request(&peer, message);
+        debug!("Send request id {}", id);
     }
 }

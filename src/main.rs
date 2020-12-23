@@ -35,10 +35,14 @@ fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String) -> Result<()> {
         "GET" => {
             swarm.get_record (next_item(&mut items, "key")?);
         }
-        "SEND"|"SAY" => {
+        "SAY"|"PUBLISH" => {
             swarm.publish(rest_of(items)?)?;
         }
-
+        "SEND"|"REQ" => {
+            let peer = next_item(&mut items, "peer id")?.parse()?;
+            let message = rest_of(items)?;
+            swarm.send_message(peer, message);
+        }
         "PROVIDE" => {
             let key = next_item(&mut items, "key")?;
             swarm.start_providing(key)?;
