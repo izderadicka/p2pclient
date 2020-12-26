@@ -1,12 +1,26 @@
-use crate::{error, utils};
+use crate::{error, input::OutputSwitch, utils};
 use error::*;
-use libp2p::{NetworkBehaviour, PeerId, gossipsub::{
+use libp2p::{
+    gossipsub::{
         Gossipsub, GossipsubConfigBuilder, GossipsubEvent, MessageAuthenticity, MessageId, Topic,
         ValidationMode,
-    }, identify::{Identify, IdentifyEvent}, identity::Keypair, kad::{
+    },
+    identify::{Identify, IdentifyEvent},
+    identity::Keypair,
+    kad::{
         kbucket, record::store::MemoryStore, record::Key, store::RecordStore, AddProviderOk,
         Addresses, Kademlia, KademliaEvent, PeerRecord, PutRecordOk, QueryResult, Quorum, Record,
-    }, mdns::{Mdns, MdnsEvent}, ping::PingConfig, ping::{Ping, PingEvent}, request_response::{ProtocolSupport, RequestResponse, RequestResponseConfig, RequestResponseEvent, RequestResponseMessage}, swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent}};
+    },
+    mdns::{Mdns, MdnsEvent},
+    ping::PingConfig,
+    ping::{Ping, PingEvent},
+    request_response::{
+        ProtocolSupport, RequestResponse, RequestResponseConfig, RequestResponseEvent,
+        RequestResponseMessage,
+    },
+    swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, SwarmEvent},
+    NetworkBehaviour, PeerId,
+};
 use proto::ProtocolCodec;
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
@@ -15,7 +29,7 @@ use std::{
     hash::Hash,
     hash::Hasher,
     iter::once,
-    time::Duration,
+    time::{Duration, Instant},
 };
 pub use transport::build_transport;
 use utils::*;
@@ -42,25 +56,40 @@ pub struct OurNetwork {
     my_id: PeerId,
     #[behaviour(ignore)]
     kad_boostrap_started: bool,
+    #[behaviour(ignore)]
+    started: Instant,
+    #[behaviour(ignore)]
+    outputs: OutputSwitch,
+
 }
 
 impl NetworkBehaviourEventProcess<RequestResponseEvent<String, String>> for OurNetwork {
     fn inject_event(&mut self, evt: RequestResponseEvent<String, String>) {
-        if let RequestResponseEvent::Message{message, peer} = evt {
+        if let RequestResponseEvent::Message { message, peer } = evt {
             match message {
-                RequestResponseMessage::Response{response, request_id} =>  
-                    println!("Got response message id {} from {}: {}", request_id, peer, response), 
+                RequestResponseMessage::Response {
+                    response,
+                    request_id,
+                } => println!(
+                    "Got response message id {} from {}: {}",
+                    request_id, peer, response
+                ),
 
-                RequestResponseMessage::Request{request_id, request, channel} => {
-                    debug!("Got request message id {} from {}: {}", request_id, peer, request);
+                RequestResponseMessage::Request {
+                    request_id,
+                    request,
+                    channel,
+                } => {
+                    debug!(
+                        "Got request message id {} from {}: {}",
+                        request_id, peer, request
+                    );
                     let reply = "Confirm ".to_string() + &request;
-                    self.rpc.send_response(channel, reply).unwrap_or_else(|e| error!("Error sending reply {}", e));
+                    self.rpc
+                        .send_response(channel, reply)
+                        .unwrap_or_else(|e| error!("Error sending reply {}", e));
                 }
-
             }
-
-           
-
         } else {
             debug!("RPC event {:?}", evt)
         }
@@ -86,78 +115,81 @@ impl NetworkBehaviourEventProcess<IdentifyEvent> for OurNetwork {
 impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
     fn inject_event(&mut self, evt: KademliaEvent) {
         match evt {
-            KademliaEvent::QueryResult { result, .. } => match result {
-                QueryResult::GetProviders(Ok(ok)) => {
-                    debug!("Got providers {:?}", ok);
-                    println!(
-                        "Key {} is provided by ({})",
-                        ok.key.printable(),
-                        ok.providers.printable_list()
-                    );
-                }
-                QueryResult::GetProviders(Err(err)) => {
-                    error!("Failed to get providers: {:?}", err);
-                }
-                QueryResult::GetRecord(Ok(ok)) => {
-                    debug!("Got record: {:?}", ok);
-                    for PeerRecord {
-                        record: Record { key, value, .. },
-                        ..
-                    } in ok.records
-                    {
-                        println!("Record {:?} = {:?}", key.printable(), value.printable(),);
-                    }
-                }
-                QueryResult::GetRecord(Err(err)) => {
-                    error!("Failed to get record: {:?}", err);
-                }
-                QueryResult::PutRecord(Ok(PutRecordOk { key })) => {
-                    debug!("Successfully put record {:?}", key.printable());
-                }
-                QueryResult::PutRecord(Err(err)) => {
-                    error!("Failed to put record: {:?}", err);
-                }
-                QueryResult::StartProviding(Ok(AddProviderOk { key })) => {
-                    debug!("Successfully put provider record {:?}", key.printable());
-                }
-                QueryResult::StartProviding(Err(err)) => {
-                    error!("Failed to put provider record: {:?}", err);
-                }
-
-                QueryResult::GetClosestPeers(Ok(res)) => {
-                    debug!("Got closest peers {:?}", res);
-                    println!("Closest peers for {} are:", res.key.printable());
-                    let search_key = kbucket::Key::new(res.key);
-                    for peer in res.peers {
-                        let other_key: kbucket::Key<_> = peer.clone().into();
-                        let distance = search_key.distance(&other_key);
-                        let addresses = self.kad.addresses_of_peer(&peer);
+            KademliaEvent::QueryResult { result, id, stats } => {
+                debug!("Got response for query id {:?}, stats {:?}", id, stats);
+                match result {
+                    QueryResult::GetProviders(Ok(ok)) => {
+                        debug!("Got providers {:?}", ok);
                         println!(
-                            "{} {} {}",
-                            peer,
-                            distance.ilog2().unwrap_or(0),
-                            addresses.printable_list()
+                            "Key {} is provided by ({})",
+                            ok.key.printable(),
+                            ok.providers.printable_list()
                         );
                     }
+                    QueryResult::GetProviders(Err(err)) => {
+                        error!("Failed to get providers: {:?}", err);
+                    }
+                    QueryResult::GetRecord(Ok(ok)) => {
+                        debug!("Got record: {:?}", ok);
+                        for PeerRecord {
+                            record: Record { key, value, .. },
+                            ..
+                        } in ok.records
+                        {
+                            println!("Record {:?} = {:?}", key.printable(), value.printable(),);
+                        }
+                    }
+                    QueryResult::GetRecord(Err(err)) => {
+                        error!("Failed to get record: {:?}", err);
+                    }
+                    QueryResult::PutRecord(Ok(PutRecordOk { key })) => {
+                        debug!("Successfully put record {:?}", key.printable());
+                    }
+                    QueryResult::PutRecord(Err(err)) => {
+                        error!("Failed to put record: {:?}", err);
+                    }
+                    QueryResult::StartProviding(Ok(AddProviderOk { key })) => {
+                        debug!("Successfully put provider record {:?}", key.printable());
+                    }
+                    QueryResult::StartProviding(Err(err)) => {
+                        error!("Failed to put provider record: {:?}", err);
+                    }
+
+                    QueryResult::GetClosestPeers(Ok(res)) => {
+                        debug!("Got closest peers {:?}", res);
+                        println!("Closest peers for {} are:", res.key.printable());
+                        let search_key = kbucket::Key::new(res.key);
+                        for peer in res.peers {
+                            let other_key: kbucket::Key<_> = peer.clone().into();
+                            let distance = search_key.distance(&other_key);
+                            let addresses = self.kad.addresses_of_peer(&peer);
+                            println!(
+                                "{} {} {}",
+                                peer,
+                                distance.ilog2().unwrap_or(0),
+                                addresses.printable_list()
+                            );
+                        }
+                    }
+                    QueryResult::GetClosestPeers(Err(e)) => {
+                        error!("Error getting closest peers: {:?}", e);
+                    }
+                    QueryResult::Bootstrap(Ok(boot)) => {
+                        debug!("Boostrap done: {:?}", boot)
+                    }
+                    QueryResult::Bootstrap(Err(e)) => {
+                        error!("Boostrap error: {:?}", e);
+                    }
+                    QueryResult::RepublishProvider(res) => match res {
+                        Ok(r) => debug!("Republished provider: {:?}", r),
+                        Err(e) => error!("Error republishing provider: {:?}", e),
+                    },
+                    QueryResult::RepublishRecord(res) => match res {
+                        Ok(r) => debug!("Republished record: {:?}", r),
+                        Err(e) => error!("Error republishing record: {:?}", e),
+                    },
                 }
-                QueryResult::GetClosestPeers(Err(e)) => {
-                    error!("Error getting closest peers: {:?}", e);
-                }
-                QueryResult::Bootstrap(Ok(boot)) => {
-                    debug!("Boostrap done: {:?}", boot)
-                }
-                QueryResult::Bootstrap(Err(e)) => {
-                    error!("Boostrap error: {:?}", e);
-                }
-                QueryResult::RepublishProvider(res) => match res {
-                    Ok(r) => debug!("Republished provider: {:?}", r),
-                    Err(e) => error!("Error republishing provider: {:?}", e),
-                },
-                QueryResult::RepublishRecord(res) => match res {
-                    Ok(r) => debug!("Republished record: {:?}", r),
-                    Err(e) => error!("Error republishing record: {:?}", e),
-                },
-            },
+            }
             KademliaEvent::RoutablePeer { peer, address } => {
                 debug!(
                     "Peer discovered {} at {}, but is not added to table",
@@ -274,7 +306,7 @@ impl OurNetwork {
         }
     }
 
-    pub async fn new(my_id: PeerId, key: Keypair, topic: String) -> Result<Self> {
+    pub async fn new(my_id: PeerId, key: Keypair, topic: String, outputs: OutputSwitch) -> Result<Self> {
         let topic = Topic::new(topic);
         let cfg = GossipsubConfigBuilder::new()
             .message_id_fn(|msg| {
@@ -314,6 +346,8 @@ impl OurNetwork {
                 env!("CARGO_PKG_NAME").to_string() + "/" + env!("CARGO_PKG_VERSION"),
                 key.public(),
             ),
+            started: Instant::now(),
+            outputs,
         };
         Ok(behaviour)
     }
@@ -417,5 +451,9 @@ impl OurNetwork {
     pub fn send_message(&mut self, peer: PeerId, message: String) {
         let id = self.rpc.send_request(&peer, message);
         debug!("Send request id {}", id);
+    }
+
+    pub fn online_time(&self) -> Duration {
+        Instant::now().duration_since(self.started)
     }
 }

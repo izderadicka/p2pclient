@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate log;
 
+use input::{InputOutputSwitch, OutputId, OutputSwitch};
 use libp2p::{PeerId, Swarm, swarm::NetworkBehaviour, core::connection::ConnectionLimits, identity::Keypair, 
     swarm::SwarmBuilder};
 
@@ -8,21 +9,28 @@ use args::Args;
 use error::Result;
 use net::{build_transport, OurNetwork};
 use std::time::Duration;
-use tokio::{
-    io::{self, AsyncBufReadExt, BufReader},
-    stream::StreamExt,
-};
+use futures::{future::poll_fn, prelude::*};
+use async_std::{task, io};
+use std::task::{Poll, Context};
 use utils::*;
 
 mod args;
 mod error;
 mod net;
 mod utils;
+mod input;
 
 const ADDR: &str = "/ip4/127.0.0.1/tcp/0";
 const TIMEOUT_SECS: u64 = 20;
 
-fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String) -> Result<()> {
+fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: OutputId, out: OutputSwitch) -> Result<()> 
+
+{
+    macro_rules! outln {
+        ($($p:expr),+) => {
+            out.println(output_id, format!($($p),+))
+        }
+    }
     let mut items = line.split(' ').filter(|s| !s.is_empty());
 
     let cmd = next_item(&mut items, "command")?.to_ascii_uppercase();
@@ -54,7 +62,7 @@ fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String) -> Result<()> {
         "GET_PROVIDERS" => {
             let key = next_item(&mut items, "key")?;
             if ! swarm.get_providers(key) {
-                println!("Key {} is provided locally", key);
+                out.println(output_id, format!("Key {} is provided locally", key));
             }
         }
         "GET_PEERS" => {
@@ -67,32 +75,49 @@ fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String) -> Result<()> {
                 let (start, end) = b.range();
                 let start = start.ilog2().unwrap_or(0);
                 let end = end.ilog2().unwrap_or(0);
-                println!("({:X} - {:X}) => {}", start, end, b.num_entries())
+                outln!("({:X} - {:X}) => {}", start, end, b.num_entries())
             }
         }
         "ADDR" => {
             let peer: PeerId = next_item(&mut items, "peer_id")?.parse()?;
             let addrs = swarm.addresses_of_peer(&peer);
-            println!(
+            outln!(
                 "Peer {} is known to have these addresses {}",
                 peer,
                 addrs.printable_list()
             );
         }
-        "MY_ID" => {
-            println!("My ID is {}", Swarm::local_peer_id(&swarm))
+        "INFO" => {
+            let net_info = Swarm::network_info(&swarm);
+            let conns = net_info.connection_counters();
+            let mut t = swarm.online_time().as_secs();
+            let hours = t / 3600;
+            t = t - hours * 3600;
+            let mins = t / 60;
+            let secs = t % 60;
+
+            outln!("Running duration: {}:{:02}:{:02}",hours, mins, secs);
+            outln!("Connected peers: {}", net_info.num_peers());
+            outln!("Connections: {}", conns.num_established());
+            outln!("Pending connections: {}", conns.num_pending());
         }
-        "HELP" => println!(
+        "MY_ID" => {
+            outln!("My ID is {}", Swarm::local_peer_id(&swarm))
+        }
+        "HELP" => outln!(
             "\
-PUT <KEY> <VALUE>
-GET <KEY>
-SEND <MESSAGE>
-PROVIDE <KEY>
-STOP_PROVIDE <KEY>
-GET_PROVIDERS <KEY>
-GET_PEERS <KEY or PEER_ID>
-BUCKETS
-MY_ID\
+PUT <KEY> <VALUE>                   Puts value into Kademlia DHT under given key
+GET <KEY>                           Gets value from Kademlia DHT from given key 
+SAY|PUBLISH <MESSAGE>               Publishes message to all peers 
+PROVIDE <KEY>                       Makes itself a provider of the key
+STOP_PROVIDE <KEY>                  Stops itself providing the key
+GET_PROVIDERS <KEY>                 Gets all providers for given key
+GET_PEERS <KEY or PEER_ID>          Gets closest peers for given peer_id or arbitrary key
+SEND|REQ <PEER_ID> <MESSAGE>        Sends request message to given peer (peers echos back)
+ADDR <PEER_ID>                      Prints known addresses for given peer_id
+BUCKETS                             Lists local Kademlia buckets (peers routing)
+INFO                                Prints some client info
+MY_ID                               Prints local peer_id\
         "
         ),
         _ => error!("Invalid command {}", cmd),
@@ -101,8 +126,7 @@ MY_ID\
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     env_logger::try_init()?;
     let args = Args::from_args();
     info!("Started");
@@ -112,53 +136,46 @@ async fn main() -> Result<()> {
     info!("My id is {}", my_id.to_base58());
 
     let transport = build_transport(key.clone(), Duration::from_secs(TIMEOUT_SECS))?;
-    let net = OurNetwork::new(my_id.clone(), key, "test_chat".into()).await?;
+    let mut input = InputOutputSwitch::new(!args.no_input);
+    let net = task::block_on(OurNetwork::new(my_id.clone(), key, "test_chat".into(), input.outputs()))?;
 
     let mut swarm = SwarmBuilder::new(transport, net, my_id)
-        .executor(Box::new(|f| {
-            tokio::spawn(f);
-        }))
         .connection_limits(ConnectionLimits::default())
         .build();
 
-    for peer_addr in args.peers {
+    for peer_addr in args.peers.iter() {
         let addr = peer_addr.parse()?;
         Swarm::dial_addr(&mut swarm, addr)?;
     }
 
     let _listener_id = Swarm::listen_on(&mut swarm, ADDR.parse().unwrap())?;
 
-    if args.no_input {
-        loop {
-            let evt = swarm.next_event().await;
-            swarm.handle_event(evt)
-        }
-    } else {
-        let mut input = BufReader::new(io::stdin()).lines();
-
-        loop {
-            tokio::select! {
-                line = input.next() => {
-                    match line {
-                        Some(Ok(line)) => {
-
-                            handle_input(&mut swarm, line).unwrap_or_else(|e| error!("Input error: {}", e));
-                        },
-                        None => {
-                            debug!("End of stdin");
-                            break
-                        }
-                        Some(Err(e)) => {
-                            error!("error reading stdin: {}", e);
+    task::block_on(async move {
+            loop {
+                futures::select! {
+                    line = input.next().fuse() => {
+                        match line {
+                            Some((line, input_id)) => {
+    
+                                handle_input(&mut swarm, line, input_id, input.outputs()).unwrap_or_else(|e| error!("Input error: {}", e));
+                            },
+                            None => {
+                                warn!("End of input");
+                                break
+                            }
                         }
                     }
-                }
-                event = swarm.next_event() => {
-                    swarm.handle_event(event)
+                    event = swarm.next_event().fuse() => {
+                        swarm.handle_event(event)
+                    }
                 }
             }
-        }
-    }
+        
+
+        });
+
+    
+    
 
     info!("Finished");
     Ok(())

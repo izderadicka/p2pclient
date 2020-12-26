@@ -10,7 +10,7 @@ use libp2p::{
 use crate::error;
 
 pub fn build_transport(key: Keypair, timeout: Duration) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
-    let transport = tcp::TokioTcpConfig::new().nodelay(true);
+    let transport = tcp::TcpConfig::new().nodelay(true);
     let noise_key = noise::Keypair::<noise::X25519Spec>::new().into_authentic(&key)?;
     let noise = noise::NoiseConfig::xx(noise_key).into_authenticated();
     let mux = yamux::YamuxConfig::default();

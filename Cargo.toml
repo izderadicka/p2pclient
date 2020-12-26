@@ -8,13 +8,14 @@ edition = "2018"
 
 [dependencies]
 
-libp2p = {version="0.32", features=["tcp-tokio"]}
+libp2p = {version="0.32"}
 anyhow = "1.0"
-tokio = {version="0.3", features=["full"]}
+async-std = {version="1.8", features=["unstable"]}
 structopt = "0.3"
 futures = "0.3"
 env_logger = "0.8"
 log = "0.4"
 bs58 = "0.4"
 async-trait = "0.1"
+
 
