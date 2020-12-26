@@ -9,9 +9,9 @@ use args::Args;
 use error::Result;
 use net::{build_transport, OurNetwork};
 use std::time::Duration;
-use futures::{future::poll_fn, prelude::*};
-use async_std::{task, io};
-use std::task::{Poll, Context};
+use futures::{prelude::*};
+use async_std::{task};
+
 use utils::*;
 
 mod args;
@@ -23,12 +23,12 @@ mod input;
 const ADDR: &str = "/ip4/127.0.0.1/tcp/0";
 const TIMEOUT_SECS: u64 = 20;
 
-fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: OutputId, out: OutputSwitch) -> Result<()> 
+async fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: OutputId, out: OutputSwitch) -> Result<()> 
 
 {
     macro_rules! outln {
         ($($p:expr),+) => {
-            out.println(output_id, format!($($p),+))
+            out.aprintln(output_id, format!($($p),+)).await
         }
     }
     let mut items = line.split(' ').filter(|s| !s.is_empty());
@@ -41,7 +41,7 @@ fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: OutputId
             swarm.put_record(key, value)?;
         }
         "GET" => {
-            swarm.get_record (next_item(&mut items, "key")?);
+            swarm.get_record (next_item(&mut items, "key")?, output_id).await;
         }
         "SAY"|"PUBLISH" => {
             swarm.publish(rest_of(items)?)?;
@@ -157,7 +157,7 @@ fn main() -> Result<()> {
                         match line {
                             Some((line, input_id)) => {
     
-                                handle_input(&mut swarm, line, input_id, input.outputs()).unwrap_or_else(|e| error!("Input error: {}", e));
+                                handle_input(&mut swarm, line, input_id, input.outputs()).await.unwrap_or_else(|e| error!("Input error: {}", e));
                             },
                             None => {
                                 warn!("End of input");

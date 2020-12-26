@@ -1,4 +1,4 @@
-use crate::{error, input::OutputSwitch, utils};
+use crate::{error, input::{OutputId, OutputSwitch}, utils};
 use error::*;
 use libp2p::{
     gossipsub::{
@@ -70,10 +70,10 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<String, String>> for OurN
                 RequestResponseMessage::Response {
                     response,
                     request_id,
-                } => println!(
+                } => self.outputs.reply(request_id,format!(
                     "Got response message id {} from {}: {}",
                     request_id, peer, response
-                ),
+                )),
 
                 RequestResponseMessage::Request {
                     request_id,
@@ -115,16 +115,16 @@ impl NetworkBehaviourEventProcess<IdentifyEvent> for OurNetwork {
 impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
     fn inject_event(&mut self, evt: KademliaEvent) {
         match evt {
-            KademliaEvent::QueryResult { result, id, stats } => {
-                debug!("Got response for query id {:?}, stats {:?}", id, stats);
+            KademliaEvent::QueryResult { result, id: query_id, stats } => {
+                debug!("Got response for query id {:?}, stats {:?}", query_id, stats);
                 match result {
                     QueryResult::GetProviders(Ok(ok)) => {
                         debug!("Got providers {:?}", ok);
-                        println!(
+                        self.outputs.reply(query_id, format!(
                             "Key {} is provided by ({})",
                             ok.key.printable(),
                             ok.providers.printable_list()
-                        );
+                        ));
                     }
                     QueryResult::GetProviders(Err(err)) => {
                         error!("Failed to get providers: {:?}", err);
@@ -136,10 +136,12 @@ impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
                             ..
                         } in ok.records
                         {
-                            println!("Record {:?} = {:?}", key.printable(), value.printable(),);
+                            self.outputs.reply(query_id,
+                                format!("Record {:?} = {:?}", key.printable(), value.printable(),));
                         }
                     }
                     QueryResult::GetRecord(Err(err)) => {
+                        self.outputs.cancel_pending(query_id);
                         error!("Failed to get record: {:?}", err);
                     }
                     QueryResult::PutRecord(Ok(PutRecordOk { key })) => {
@@ -157,19 +159,21 @@ impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
 
                     QueryResult::GetClosestPeers(Ok(res)) => {
                         debug!("Got closest peers {:?}", res);
-                        println!("Closest peers for {} are:", res.key.printable());
+                        let mut msg = format!("Closest peers for {} are:", res.key.printable());
                         let search_key = kbucket::Key::new(res.key);
                         for peer in res.peers {
                             let other_key: kbucket::Key<_> = peer.clone().into();
                             let distance = search_key.distance(&other_key);
                             let addresses = self.kad.addresses_of_peer(&peer);
-                            println!(
+                            msg += 
+                            &format!(
                                 "{} {} {}",
                                 peer,
                                 distance.ilog2().unwrap_or(0),
                                 addresses.printable_list()
                             );
                         }
+                        self.outputs.reply(query_id, msg)
                     }
                     QueryResult::GetClosestPeers(Err(e)) => {
                         error!("Error getting closest peers: {:?}", e);
@@ -260,13 +264,14 @@ impl NetworkBehaviourEventProcess<GossipsubEvent> for OurNetwork {
         match evt {
             GossipsubEvent::Message(peer, msg_id, m) => {
                 debug!("Received message {:?}", m);
-                println!(
+                let msg = format!(
                     "({:?} through {}; id:{})->{}",
                     m.source,
                     peer,
                     msg_id,
                     m.data.printable()
-                )
+                );
+                self.outputs.send_to_all(msg);
             }
             GossipsubEvent::Subscribed { peer_id, topic } => {
                 debug!("Peer {} subscribed to {:?}", peer_id, topic)
@@ -372,12 +377,13 @@ impl OurNetwork {
         Ok(())
     }
 
-    pub fn get_record<K>(&mut self, key: K)
+     pub async fn get_record<K>(&mut self, key: K, output_id: OutputId)
     where
         K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
-        self.kad.get_record(&key, Quorum::One);
+        let query_id = self.kad.get_record(&key, Quorum::One);
+        self.outputs.register_pending(output_id, query_id).await
     }
 
     pub fn publish<T>(&mut self, msg: T) -> Result<()>
