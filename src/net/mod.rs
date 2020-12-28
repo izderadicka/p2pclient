@@ -1,4 +1,8 @@
-use crate::{error, input::{OutputId, OutputSwitch}, utils};
+use crate::{
+    error,
+    input::{OutputId, OutputSwitch},
+    utils,
+};
 use error::*;
 use libp2p::{
     gossipsub::{
@@ -60,20 +64,22 @@ pub struct OurNetwork {
     started: Instant,
     #[behaviour(ignore)]
     outputs: OutputSwitch,
-
 }
 
 impl NetworkBehaviourEventProcess<RequestResponseEvent<String, String>> for OurNetwork {
     fn inject_event(&mut self, evt: RequestResponseEvent<String, String>) {
-        if let RequestResponseEvent::Message { message, peer } = evt {
-            match message {
+        match evt {
+            RequestResponseEvent::Message { message, peer } => match message {
                 RequestResponseMessage::Response {
                     response,
                     request_id,
-                } => self.outputs.reply(request_id,format!(
-                    "Got response message id {} from {}: {}",
-                    request_id, peer, response
-                )),
+                } => self.outputs.reply(
+                    request_id,
+                    format!(
+                        "Got response message id {} from {}: {}",
+                        request_id, peer, response
+                    ),
+                ),
 
                 RequestResponseMessage::Request {
                     request_id,
@@ -89,9 +95,16 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<String, String>> for OurN
                         .send_response(channel, reply)
                         .unwrap_or_else(|e| error!("Error sending reply {}", e));
                 }
+            },
+            RequestResponseEvent::OutboundFailure {
+                request_id, error, ..
+            } => {
+                self.outputs
+                    .reply(request_id, format!("Error sending request {:?}", error));
             }
-        } else {
-            debug!("RPC event {:?}", evt)
+            _ => {
+                debug!("RPC event {:?}", evt)
+            }
         }
     }
 }
@@ -115,34 +128,58 @@ impl NetworkBehaviourEventProcess<IdentifyEvent> for OurNetwork {
 impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
     fn inject_event(&mut self, evt: KademliaEvent) {
         match evt {
-            KademliaEvent::QueryResult { result, id: query_id, stats } => {
-                debug!("Got response for query id {:?}, stats {:?}", query_id, stats);
+            KademliaEvent::QueryResult {
+                result,
+                id: query_id,
+                stats,
+            } => {
+                debug!(
+                    "Got response for query id {:?}, stats {:?}",
+                    query_id, stats
+                );
+
+                macro_rules! failure {
+                    ($msg:literal, $err: ident) => {{
+                        let msg = format!($msg, $err);
+                        error!("{}", msg);
+                        self.outputs.reply(query_id, msg);
+                    }};
+                }
+
                 match result {
                     QueryResult::GetProviders(Ok(ok)) => {
                         debug!("Got providers {:?}", ok);
-                        self.outputs.reply(query_id, format!(
-                            "Key {} is provided by ({})",
-                            ok.key.printable(),
-                            ok.providers.printable_list()
-                        ));
+                        self.outputs.reply(
+                            query_id,
+                            format!(
+                                "Key {} is provided by ({})",
+                                ok.key.printable(),
+                                ok.providers.printable_list()
+                            ),
+                        );
                     }
                     QueryResult::GetProviders(Err(err)) => {
-                        error!("Failed to get providers: {:?}", err);
+                        failure!("Failed to get providers: {:?}", err);
                     }
                     QueryResult::GetRecord(Ok(ok)) => {
                         debug!("Got record: {:?}", ok);
-                        for PeerRecord {
-                            record: Record { key, value, .. },
-                            ..
-                        } in ok.records
-                        {
-                            self.outputs.reply(query_id,
-                                format!("Record {:?} = {:?}", key.printable(), value.printable(),));
-                        }
+                        let reply: String = ok
+                            .records
+                            .into_iter()
+                            .map(|r| {
+                                let PeerRecord {
+                                    record: Record { key, value, .. },
+                                    ..
+                                } = r;
+                                format!("Record {:?} = {:?}", key.printable(), value.printable(),)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        self.outputs.reply(query_id, reply);
                     }
                     QueryResult::GetRecord(Err(err)) => {
-                        self.outputs.cancel_pending(query_id);
-                        error!("Failed to get record: {:?}", err);
+                        failure!("Failed to get record: {:?}", err)
                     }
                     QueryResult::PutRecord(Ok(PutRecordOk { key })) => {
                         debug!("Successfully put record {:?}", key.printable());
@@ -151,10 +188,12 @@ impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
                         error!("Failed to put record: {:?}", err);
                     }
                     QueryResult::StartProviding(Ok(AddProviderOk { key })) => {
-                        debug!("Successfully put provider record {:?}", key.printable());
+                        let msg = format!("Successfully put provider record {:?}", key.printable());
+                        debug!("{}", msg);
+                        self.outputs.reply(query_id, msg);
                     }
                     QueryResult::StartProviding(Err(err)) => {
-                        error!("Failed to put provider record: {:?}", err);
+                        failure!("Failed to put provider record: {:?}", err);
                     }
 
                     QueryResult::GetClosestPeers(Ok(res)) => {
@@ -165,8 +204,7 @@ impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
                             let other_key: kbucket::Key<_> = peer.clone().into();
                             let distance = search_key.distance(&other_key);
                             let addresses = self.kad.addresses_of_peer(&peer);
-                            msg += 
-                            &format!(
+                            msg += &format!(
                                 "{} {} {}",
                                 peer,
                                 distance.ilog2().unwrap_or(0),
@@ -176,7 +214,7 @@ impl NetworkBehaviourEventProcess<KademliaEvent> for OurNetwork {
                         self.outputs.reply(query_id, msg)
                     }
                     QueryResult::GetClosestPeers(Err(e)) => {
-                        error!("Error getting closest peers: {:?}", e);
+                        failure!("Error getting closest peers: {:?}", e);
                     }
                     QueryResult::Bootstrap(Ok(boot)) => {
                         debug!("Boostrap done: {:?}", boot)
@@ -311,7 +349,12 @@ impl OurNetwork {
         }
     }
 
-    pub async fn new(my_id: PeerId, key: Keypair, topic: String, outputs: OutputSwitch) -> Result<Self> {
+    pub async fn new(
+        my_id: PeerId,
+        key: Keypair,
+        topic: String,
+        outputs: OutputSwitch,
+    ) -> Result<Self> {
         let topic = Topic::new(topic);
         let cfg = GossipsubConfigBuilder::new()
             .message_id_fn(|msg| {
@@ -359,7 +402,7 @@ impl OurNetwork {
 
     //usage methods for convenience
 
-    pub fn put_record<K, V>(&mut self, key: K, value: V) -> Result<()>
+    pub async fn put_record<K, V>(&mut self, key: K, value: V, output_id: OutputId) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: Into<Vec<u8>>,
@@ -370,14 +413,16 @@ impl OurNetwork {
             publisher: None,
             expires: None,
         };
-        self.kad
+        let query_id = self
+            .kad
             .put_record(record, Quorum::One)
             .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
+        self.outputs.register_pending(output_id, query_id).await;
 
         Ok(())
     }
 
-     pub async fn get_record<K>(&mut self, key: K, output_id: OutputId)
+    pub async fn get_record<K>(&mut self, key: K, output_id: OutputId)
     where
         K: AsRef<[u8]>,
     {
@@ -386,59 +431,63 @@ impl OurNetwork {
         self.outputs.register_pending(output_id, query_id).await
     }
 
-    pub fn publish<T>(&mut self, msg: T) -> Result<()>
+    pub async fn publish<T>(&mut self, msg: T, output_id: OutputId) -> Result<()>
     where
         T: Into<Vec<u8>>,
     {
         self.pubsub
             .publish(&self.topic, msg)
-            .map_err(|e| Error::msg(format!("Publish error{:?}", e)))
+            .map_err(|e| Error::msg(format!("Publish error{:?}", e)))?;
+        self.outputs.aprintln(output_id, "Message published").await;
+        Ok(())
     }
 
-    pub fn start_providing<K>(&mut self, key: K) -> Result<()>
+    pub async fn start_providing<K>(&mut self, key: K, output_id: OutputId) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
-        self.kad
+        let query_id = self
+            .kad
             .start_providing(key)
             .map_err(|e| Error::msg(format!("Store error {:?}", e)))?;
+        self.outputs.register_pending(output_id, query_id).await;
 
         Ok(())
     }
 
-    pub fn stop_providing<K>(&mut self, key: K)
+    pub async fn stop_providing<K>(&mut self, key: K, output_id: OutputId)
     where
         K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
         self.kad.stop_providing(&key);
+        self.outputs
+            .aprintln(output_id, "Stopped providing key")
+            .await;
     }
 
-    pub fn get_providers<K>(&mut self, key: K) -> bool
+    pub async fn get_providers<K>(&mut self, key: K, output_id: OutputId) -> bool
     where
         K: AsRef<[u8]>,
     {
         let key = Key::new(&key);
         let providers = self.kad.store_mut().providers(&key);
         debug!("Locally known providers {:?}", providers);
-        if providers
-            .iter()
-            .find(|r| r.provider == self.my_id)
-            .is_some()
-        {
+        if providers.iter().any(|r| r.provider == self.my_id) {
             false
         } else {
-            self.kad.get_providers(key);
+            let query_id = self.kad.get_providers(key);
+            self.outputs.register_pending(output_id, query_id).await;
             true
         }
     }
 
-    pub fn get_closest_peers<K>(&mut self, key: K)
+    pub async fn get_closest_peers<K>(&mut self, key: K, output_id: OutputId)
     where
         K: AsRef<[u8]>,
     {
-        if let Ok(peer) = std::str::from_utf8(key.as_ref())
+        let query_id = if let Ok(peer) = std::str::from_utf8(key.as_ref())
             .map_err(|_| ())
             .and_then(|s| s.parse::<PeerId>().map_err(|_| ()))
         {
@@ -446,6 +495,8 @@ impl OurNetwork {
         } else {
             self.kad.get_closest_peers(key.as_ref())
         };
+
+        self.outputs.register_pending(output_id, query_id).await;
     }
 
     pub fn buckets(
@@ -454,9 +505,10 @@ impl OurNetwork {
         self.kad.kbuckets()
     }
 
-    pub fn send_message(&mut self, peer: PeerId, message: String) {
+    pub async fn send_message(&mut self, peer: PeerId, message: String, output_id: OutputId) {
         let id = self.rpc.send_request(&peer, message);
         debug!("Send request id {}", id);
+        self.outputs.register_pending(output_id, id).await;
     }
 
     pub fn online_time(&self) -> Duration {

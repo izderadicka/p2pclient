@@ -1,25 +1,25 @@
 use std::io;
 
 use async_trait::async_trait;
-use libp2p::core::upgrade::{ReadOneError, read_one, write_one};
+use libp2p::core::upgrade::{read_one, write_one, ReadOneError};
 use libp2p::request_response::RequestResponseCodec;
 
 pub const PROTOCOL_NAME: &str = "/demo/0.0.1";
 pub const MAX_SIZE: usize = 10_000; //maximum size od message
 
-
 macro_rules! read {
-    ($io: expr) => {
-        {
+    ($io: expr) => {{
         let data = read_one($io, MAX_SIZE).await.map_err(|err| match err {
             ReadOneError::Io(e) => e,
-            ReadOneError::TooLarge{requested, ..} => io::Error::new(io::ErrorKind::InvalidData, format!("Request message too large {}", requested))
+            ReadOneError::TooLarge { requested, .. } => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Request message too large {}", requested),
+            ),
         })?;
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-    };
+    }};
 }
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct ProtocolCodec;
 
 #[async_trait]

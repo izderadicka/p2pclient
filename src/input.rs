@@ -1,13 +1,18 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
-
 use async_std::{
-    channel::{bounded, Receiver, Sender},
+    channel::{self, Receiver},
     io,
+    net::TcpListener,
     sync::{Mutex, RwLock},
     task,
 };
+use error::Result;
 use futures::prelude::*;
 use libp2p::{kad::QueryId, request_response::RequestId};
+use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
+
+use crate::error;
+
+const INPUT_CHANNEL_SIZE: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pending {
@@ -128,17 +133,18 @@ impl OutputSwitch {
     }
 
     pub async fn register_pending(&self, output_id: OutputId, pending_id: impl Into<Pending>) {
-        if let Some(prev) = self
+        if self
             .inner
             .write()
             .await
             .pending
             .insert(pending_id.into(), output_id)
+            .is_some()
         {
             error!("For same id previous record was pending")
         };
     }
-
+    #[allow(dead_code)]
     pub fn cancel_pending(&self, pending_id: impl Into<Pending>) {
         let pending_id = pending_id.into();
         let out = self.inner.clone();
@@ -150,39 +156,43 @@ impl OutputSwitch {
 
 pub struct InputOutputSwitch {
     input_rx: Receiver<Cmd>,
-    input_tx: Sender<Cmd>,
     outputs: OutputSwitch,
 }
 
 impl InputOutputSwitch {
-    pub fn new(use_stdin: bool) -> Self {
-        let (tx, rx) = bounded(1000);
+    pub async fn new(use_stdin: bool, control_socket: Option<SocketAddr>) -> Result<Self> {
+        let (tx, rx) = channel::bounded(INPUT_CHANNEL_SIZE);
         let mut outputs = HashMap::new();
 
-        // Forwards standard input to input channel
-        if use_stdin {
-            let mut input = io::BufReader::new(io::stdin()).lines();
-
-            let input_id = OutputId::from(0);
-            let output: Output = Box::new(io::stdout());
-            outputs.insert(input_id, Mutex::new(output));
-            let sender = tx.clone();
-            task::spawn(async move {
-                while let Some(cmd) = input.next().await {
+        // macro to fwd commands
+        macro_rules! input_loop {
+            ($input:ident, $sender:ident, $output_id:ident) => {
+                while let Some(cmd) = $input.next().await {
                     match cmd {
                         Ok(cmd) => {
-                            if let Err(e) = sender.send((cmd, input_id)).await {
+                            if let Err(e) = $sender.send((cmd, $output_id)).await {
                                 error!("Input channel is closed: {}", e);
                                 break;
                             }
                         }
                         Err(e) => {
-                            error!("Std input read error: {}", e);
+                            error!("Input read error: {}", e);
                             break;
                         }
                     }
                 }
-            });
+            };
+        }
+
+        // Forwards standard input to control channel
+        if use_stdin {
+            let mut input = io::BufReader::new(io::stdin()).lines();
+
+            let output_id = OutputId::from(0);
+            let output: Output = Box::new(io::stdout());
+            outputs.insert(output_id, Mutex::new(output));
+            let sender = tx.clone();
+            task::spawn(async move { input_loop!(input, sender, output_id) });
         }
 
         let outputs = OutputSwitch {
@@ -193,11 +203,42 @@ impl InputOutputSwitch {
             })),
         };
 
-        InputOutputSwitch {
-            input_rx: rx,
-            input_tx: tx,
-            outputs,
+        // Listens on control TCP socket and forwards commands to control channel
+        if let Some(addr) = control_socket {
+            let listener = TcpListener::bind(addr).await?;
+            let sender = tx.clone();
+            let mut outputs = outputs.clone();
+            task::spawn(async move {
+                let mut incoming = listener.incoming();
+                while let Some(conn) = incoming.next().await {
+                    match conn {
+                        Ok(socket) => {
+                            let client_addr = socket
+                                .peer_addr()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|_| "<UKNOWN>".into());
+                            debug!("Client {} connected on control socket", client_addr);
+                            let (input, output) = socket.split();
+                            let output_id = outputs.add_output(Box::new(output) as Output).await;
+                            let sender = sender.clone();
+                            let outputs = outputs.clone();
+                            task::spawn(async move {
+                                let mut input = io::BufReader::new(input).lines();
+                                input_loop!(input, sender, output_id);
+                                outputs.remove_output(output_id).await;
+                                debug!("Client {} disconnected from control socket", client_addr)
+                            });
+                        }
+                        Err(e) => error!("Error on incomming control connection: {}", e),
+                    }
+                }
+            });
         }
+
+        Ok(InputOutputSwitch {
+            input_rx: rx,
+            outputs,
+        })
     }
 
     pub async fn next(&mut self) -> Option<Cmd> {

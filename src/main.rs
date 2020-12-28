@@ -2,30 +2,48 @@
 extern crate log;
 
 use input::{InputOutputSwitch, OutputId, OutputSwitch};
-use libp2p::{PeerId, Swarm, swarm::NetworkBehaviour, core::connection::ConnectionLimits, identity::Keypair, 
-    swarm::SwarmBuilder};
+use libp2p::{
+    core::connection::ConnectionLimits, identity::Keypair, swarm::NetworkBehaviour,
+    swarm::SwarmBuilder, PeerId, Swarm,
+};
 
 use args::Args;
-use error::Result;
+use async_std::task;
+use error::{Error, Result};
+use futures::prelude::*;
 use net::{build_transport, OurNetwork};
 use std::time::Duration;
-use futures::{prelude::*};
-use async_std::{task};
 
 use utils::*;
 
 mod args;
 mod error;
+mod input;
 mod net;
 mod utils;
-mod input;
 
 const ADDR: &str = "/ip4/127.0.0.1/tcp/0";
 const TIMEOUT_SECS: u64 = 20;
 
-async fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: OutputId, out: OutputSwitch) -> Result<()> 
+async fn handle_input_checked(
+    swarm: &mut Swarm<OurNetwork>,
+    line: String,
+    output_id: OutputId,
+    mut out: OutputSwitch,
+) {
+    if let Err(e) = handle_input(swarm, line, output_id, &mut out).await {
+        error!("Input error: {}", e);
+        out.aprintln(output_id, format!("Command failed : {}", e))
+            .await;
+    }
+}
 
-{
+async fn handle_input(
+    swarm: &mut Swarm<OurNetwork>,
+    line: String,
+    output_id: OutputId,
+    out: &mut OutputSwitch,
+) -> Result<()> {
     macro_rules! outln {
         ($($p:expr),+) => {
             out.aprintln(output_id, format!($($p),+)).await
@@ -38,37 +56,38 @@ async fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: Ou
         "PUT" => {
             let key = next_item(&mut items, "key")?;
             let value = rest_of(items)?;
-            swarm.put_record(key, value)?;
+            swarm.put_record(key, value, output_id).await?;
         }
         "GET" => {
-            swarm.get_record (next_item(&mut items, "key")?, output_id).await;
+            swarm
+                .get_record(next_item(&mut items, "key")?, output_id)
+                .await;
         }
-        "SAY"|"PUBLISH" => {
-            swarm.publish(rest_of(items)?)?;
+        "SAY" | "PUBLISH" => {
+            swarm.publish(rest_of(items)?, output_id).await?;
         }
-        "SEND"|"REQ" => {
+        "SEND" | "REQ" => {
             let peer = next_item(&mut items, "peer id")?.parse()?;
             let message = rest_of(items)?;
-            swarm.send_message(peer, message);
+            swarm.send_message(peer, message, output_id).await;
         }
         "PROVIDE" => {
             let key = next_item(&mut items, "key")?;
-            swarm.start_providing(key)?;
+            swarm.start_providing(key, output_id).await?;
         }
         "STOP_PROVIDE" => {
             let key = next_item(&mut items, "key")?;
-            swarm.stop_providing(key);
+            swarm.stop_providing(key, output_id).await;
         }
         "GET_PROVIDERS" => {
             let key = next_item(&mut items, "key")?;
-            if ! swarm.get_providers(key) {
+            if !swarm.get_providers(key, output_id).await {
                 out.println(output_id, format!("Key {} is provided locally", key));
             }
         }
         "GET_PEERS" => {
             let key = next_item(&mut items, "key or peer_id")?;
-                swarm.get_closest_peers(key);
-        
+            swarm.get_closest_peers(key, output_id).await;
         }
         "BUCKETS" => {
             for b in swarm.buckets() {
@@ -92,11 +111,11 @@ async fn handle_input(swarm: &mut Swarm<OurNetwork>, line: String, output_id: Ou
             let conns = net_info.connection_counters();
             let mut t = swarm.online_time().as_secs();
             let hours = t / 3600;
-            t = t - hours * 3600;
+            t -= hours * 3600;
             let mins = t / 60;
             let secs = t % 60;
 
-            outln!("Running duration: {}:{:02}:{:02}",hours, mins, secs);
+            outln!("Running duration: {}:{:02}:{:02}", hours, mins, secs);
             outln!("Connected peers: {}", net_info.num_peers());
             outln!("Connections: {}", conns.num_established());
             outln!("Pending connections: {}", conns.num_pending());
@@ -120,7 +139,10 @@ INFO                                Prints some client info
 MY_ID                               Prints local peer_id\
         "
         ),
-        _ => error!("Invalid command {}", cmd),
+        _ => {
+            error!("Invalid command {}", cmd);
+            return Err(Error::msg("Invalid command"));
+        }
     }
 
     Ok(())
@@ -136,8 +158,13 @@ fn main() -> Result<()> {
     info!("My id is {}", my_id.to_base58());
 
     let transport = build_transport(key.clone(), Duration::from_secs(TIMEOUT_SECS))?;
-    let mut input = InputOutputSwitch::new(!args.no_input);
-    let net = task::block_on(OurNetwork::new(my_id.clone(), key, "test_chat".into(), input.outputs()))?;
+    let mut input = task::block_on(InputOutputSwitch::new(!args.no_input, args.control))?;
+    let net = task::block_on(OurNetwork::new(
+        my_id.clone(),
+        key,
+        "test_chat".into(),
+        input.outputs(),
+    ))?;
 
     let mut swarm = SwarmBuilder::new(transport, net, my_id)
         .connection_limits(ConnectionLimits::default())
@@ -151,31 +178,26 @@ fn main() -> Result<()> {
     let _listener_id = Swarm::listen_on(&mut swarm, ADDR.parse().unwrap())?;
 
     task::block_on(async move {
-            loop {
-                futures::select! {
-                    line = input.next().fuse() => {
-                        match line {
-                            Some((line, input_id)) => {
-    
-                                handle_input(&mut swarm, line, input_id, input.outputs()).await.unwrap_or_else(|e| error!("Input error: {}", e));
-                            },
-                            None => {
-                                warn!("End of input");
-                                break
-                            }
+        loop {
+            futures::select! {
+                line = input.next().fuse() => {
+                    match line {
+                        Some((line, input_id)) => {
+
+                            handle_input_checked(&mut swarm, line, input_id, input.outputs()).await;
+                        },
+                        None => {
+                            warn!("End of input");
+                            break
                         }
                     }
-                    event = swarm.next_event().fuse() => {
-                        swarm.handle_event(event)
-                    }
+                }
+                event = swarm.next_event().fuse() => {
+                    swarm.handle_event(event)
                 }
             }
-        
-
-        });
-
-    
-    
+        }
+    });
 
     info!("Finished");
     Ok(())

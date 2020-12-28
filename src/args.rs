@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug)]
@@ -7,6 +9,9 @@ pub struct Args {
 
     #[structopt(long, short)]
     pub no_input: bool,
+
+    #[structopt(long, short)]
+    pub control: Option<SocketAddr>,
 }
 
 impl Args {
