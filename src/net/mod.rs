@@ -40,6 +40,7 @@ use utils::*;
 
 pub mod proto;
 pub mod transport;
+pub mod direct;
 
 #[derive(NetworkBehaviour)]
 pub struct OurNetwork {
