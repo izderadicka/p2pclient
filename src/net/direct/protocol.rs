@@ -1,7 +1,10 @@
 use std::iter;
 
-use futures::{AsyncRead, AsyncWrite, future::BoxFuture, prelude::*};
-use libp2p::{InboundUpgrade, OutboundUpgrade, core::{UpgradeInfo, upgrade}};
+use futures::{future::BoxFuture, prelude::*, AsyncRead, AsyncWrite};
+use libp2p::{
+    core::{upgrade, UpgradeInfo},
+    InboundUpgrade, OutboundUpgrade,
+};
 
 use crate::error::Error;
 
@@ -10,13 +13,14 @@ const MAX_MESSAGE_SIZE: usize = 16_384;
 
 pub type Message = String;
 
+#[derive(Debug, Clone)]
 pub struct DirectProtocolSend {
-    msg: Message
+    msg: Message,
 }
 
 impl DirectProtocolSend {
     pub fn new(msg: Message) -> Self {
-        DirectProtocolSend{msg}
+        DirectProtocolSend { msg }
     }
 }
 
@@ -30,8 +34,9 @@ impl UpgradeInfo for DirectProtocolSend {
     }
 }
 
-impl <C> OutboundUpgrade<C> for DirectProtocolSend 
-where C: AsyncWrite+Send+Unpin+'static
+impl<C> OutboundUpgrade<C> for DirectProtocolSend
+where
+    C: AsyncWrite + Send + Unpin + 'static,
 {
     type Output = ();
 
@@ -39,25 +44,18 @@ where C: AsyncWrite+Send+Unpin+'static
 
     type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
-    fn upgrade_outbound(self, mut socket: C, info: Self::Info) -> Self::Future {
+    fn upgrade_outbound(self, mut socket: C, _info: Self::Info) -> Self::Future {
         async move {
             upgrade::write_one(&mut socket, self.msg).await?;
             socket.close().await?;
             Ok(())
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct DirectProtocolReceive;
-
-impl DirectProtocolReceive {
-    pub fn new() -> Self {
-        DirectProtocolReceive {
-            
-        }
-    }
-}
 
 impl UpgradeInfo for DirectProtocolReceive {
     type Info = &'static [u8];
@@ -69,7 +67,7 @@ impl UpgradeInfo for DirectProtocolReceive {
     }
 }
 
-impl <C> InboundUpgrade<C> for DirectProtocolReceive 
+impl<C> InboundUpgrade<C> for DirectProtocolReceive
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -81,10 +79,11 @@ where
 
     fn upgrade_inbound(self, mut socket: C, _info: Self::Info) -> Self::Future {
         async move {
-        socket.close().await?;
-        let data = upgrade::read_one(&mut socket, MAX_MESSAGE_SIZE).await?;
-        let msg = String::from_utf8(data)?;
-        Ok(msg)
-        }.boxed()
+            socket.close().await?;
+            let data = upgrade::read_one(&mut socket, MAX_MESSAGE_SIZE).await?;
+            let msg = String::from_utf8(data)?;
+            Ok(msg)
+        }
+        .boxed()
     }
 }

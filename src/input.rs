@@ -102,7 +102,7 @@ impl OutputSwitch {
     }
 
     pub fn send_to_all(&self, msg: impl Into<String>) {
-        let msg: String = msg.into();
+        let msg: String = msg.into() + "\n";
         let out = self.inner.clone();
         task::spawn(async move {
             for output in out.read().await.outputs.values() {

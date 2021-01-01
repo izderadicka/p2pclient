@@ -17,5 +17,6 @@ env_logger = "0.8"
 log = "0.4"
 bs58 = "0.4"
 async-trait = "0.1"
+smallvec = "1.5"
 
 

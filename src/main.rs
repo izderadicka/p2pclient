@@ -71,6 +71,11 @@ async fn handle_input(
             let message = rest_of(items)?;
             swarm.send_message(peer, message, output_id).await;
         }
+        "DIRECT" => {
+            let peer = next_item(&mut items, "peer id")?.parse()?;
+            let message = rest_of(items)?;
+            swarm.send_direct(peer, message, output_id).await;
+        }
         "PROVIDE" => {
             let key = next_item(&mut items, "key")?;
             swarm.start_providing(key, output_id).await?;

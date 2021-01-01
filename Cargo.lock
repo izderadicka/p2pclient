@@ -1678,6 +1678,7 @@ dependencies = [
  "futures",
  "libp2p",
  "log",
+ "smallvec",
  "structopt",
 ]
 

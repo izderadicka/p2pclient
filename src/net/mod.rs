@@ -3,6 +3,7 @@ use crate::{
     input::{OutputId, OutputSwitch},
     utils,
 };
+use direct::{Direct, DirectEvent};
 use error::*;
 use libp2p::{
     gossipsub::{
@@ -38,9 +39,9 @@ use std::{
 pub use transport::build_transport;
 use utils::*;
 
+pub mod direct;
 pub mod proto;
 pub mod transport;
-pub mod direct;
 
 #[derive(NetworkBehaviour)]
 pub struct OurNetwork {
@@ -51,6 +52,7 @@ pub struct OurNetwork {
     ping: Ping,
     identify: Identify,
     rpc: RequestResponse<ProtocolCodec>,
+    direct: Direct,
 
     // other properties
     #[behaviour(ignore)]
@@ -65,6 +67,25 @@ pub struct OurNetwork {
     started: Instant,
     #[behaviour(ignore)]
     outputs: OutputSwitch,
+}
+
+impl NetworkBehaviourEventProcess<DirectEvent> for OurNetwork {
+    fn inject_event(&mut self, event: DirectEvent) {
+        match event {
+            DirectEvent::Message { message, peer_id } => self
+                .outputs
+                .send_to_all(format!("Got direct message from {}: {}", peer_id, message)),
+            DirectEvent::MessageSent { peer_id } => {
+                debug!("Direct message sent to {}", peer_id)
+            }
+            DirectEvent::Error { error, peer_id } => {
+                error!("Direct message error; to: {} error: {}", peer_id, error)
+            }
+            DirectEvent::Timeout { peer_id } => {
+                error!("Direct message to {} timeout", peer_id)
+            }
+        }
+    }
 }
 
 impl NetworkBehaviourEventProcess<RequestResponseEvent<String, String>> for OurNetwork {
@@ -388,6 +409,7 @@ impl OurNetwork {
                 once((proto::PROTOCOL_NAME.to_string(), ProtocolSupport::Full)),
                 RequestResponseConfig::default(),
             ),
+            direct: Direct::new(),
             kad_boostrap_started: false,
             my_id: my_id.clone(),
             identify: Identify::new(
@@ -514,5 +536,9 @@ impl OurNetwork {
 
     pub fn online_time(&self) -> Duration {
         Instant::now().duration_since(self.started)
+    }
+
+    pub async fn send_direct(&mut self, peer: PeerId, message: String, _output_id: OutputId) {
+        self.direct.send(&peer, message)
     }
 }

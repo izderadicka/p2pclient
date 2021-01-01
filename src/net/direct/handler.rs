@@ -1,40 +1,54 @@
-use std::{collections::VecDeque, fmt::{Display, Debug}, task::Poll};
+use std::{
+    collections::VecDeque,
+    fmt::{Debug, Display},
+    task::Poll,
+};
 
-use libp2p::swarm::{KeepAlive, ProtocolsHandler, ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol};
+use libp2p::swarm::{
+    KeepAlive, ProtocolsHandler, ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol,
+};
 
 use super::protocol::{DirectProtocolReceive, DirectProtocolSend, Message};
 use crate::error::Error as CrateError;
 
 pub type Error = DirectError<CrateError>;
 #[derive(Debug)]
-pub struct DirectError<E:Debug>(E);
-impl  DirectError<CrateError> {
-    pub fn new<E:Into<CrateError>>(e:E) -> Self {
-        DirectError(e.into())
-    }
-    pub fn msg<E: Into<String>>(msg: E) -> Self {
-        DirectError(CrateError::msg(msg.into()))
-    }
+pub struct DirectError<E: Debug>(E);
+impl DirectError<CrateError> {
+    // pub fn new<E:Into<CrateError>>(e:E) -> Self {
+    //     DirectError(e.into())
+    // }
+    // pub fn msg<E: Into<String>>(msg: E) -> Self {
+    //     DirectError(CrateError::msg(msg.into()))
+    // }
 }
-impl <E: Debug+Display> Display for DirectError<E> {
+impl<E: Debug + Display> Display for DirectError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Direct error: {}", self.0)
     }
 }
-impl <E:Display+Debug> std::error::Error for DirectError<E> {}
+impl<E: Display + Debug> std::error::Error for DirectError<E> {}
 
 pub enum DirectHandlerEvent {
     Message(Message),
     MessageSent,
     Error(CrateError),
-    Timeout
+    Timeout,
 }
 
-pub struct DirectHandler{
+pub struct DirectHandler {
     events: VecDeque<DirectHandlerEvent>,
     outgoing: VecDeque<DirectProtocolSend>,
 }
 
+impl DirectHandler {
+    pub fn new() -> Self {
+        DirectHandler {
+            events: VecDeque::new(),
+            outgoing: VecDeque::new(),
+        }
+    }
+}
 
 impl ProtocolsHandler for DirectHandler {
     type InEvent = DirectProtocolSend;
@@ -55,19 +69,11 @@ impl ProtocolsHandler for DirectHandler {
         SubstreamProtocol::new(DirectProtocolReceive, ())
     }
 
-    fn inject_fully_negotiated_inbound(
-        &mut self,
-        msg: Message,
-        _info: Self::InboundOpenInfo
-    ) {
+    fn inject_fully_negotiated_inbound(&mut self, msg: Message, _info: Self::InboundOpenInfo) {
         self.events.push_back(DirectHandlerEvent::Message(msg))
     }
 
-    fn inject_fully_negotiated_outbound(
-        &mut self,
-        _protocol: (),
-        _info: Self::OutboundOpenInfo
-    ) {
+    fn inject_fully_negotiated_outbound(&mut self, _protocol: (), _info: Self::OutboundOpenInfo) {
         self.events.push_back(DirectHandlerEvent::MessageSent);
     }
 
@@ -78,29 +84,41 @@ impl ProtocolsHandler for DirectHandler {
     fn inject_dial_upgrade_error(
         &mut self,
         _info: Self::OutboundOpenInfo,
-        error: ProtocolsHandlerUpgrErr<
-            crate::error::Error
-        >
+        error: ProtocolsHandlerUpgrErr<crate::error::Error>,
     ) {
         match error {
-            ProtocolsHandlerUpgrErr::Timeout => {self.events.push_back(DirectHandlerEvent::Timeout)}
-            ProtocolsHandlerUpgrErr::Timer => {self.events.push_back(DirectHandlerEvent::Error(CrateError::msg("Outbound Timer")))}
-            ProtocolsHandlerUpgrErr::Upgrade(e) => {self.events.push_back(DirectHandlerEvent::Error(CrateError::msg(e)))}
+            ProtocolsHandlerUpgrErr::Timeout => self.events.push_back(DirectHandlerEvent::Timeout),
+            ProtocolsHandlerUpgrErr::Timer => self
+                .events
+                .push_back(DirectHandlerEvent::Error(CrateError::msg("Outbound Timer"))),
+            ProtocolsHandlerUpgrErr::Upgrade(e) => self
+                .events
+                .push_back(DirectHandlerEvent::Error(CrateError::msg(e))),
         }
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
-       KeepAlive::No
+        KeepAlive::No
     }
 
-    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<
-        ProtocolsHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::OutEvent, Self::Error>
+    fn poll(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<
+        ProtocolsHandlerEvent<
+            Self::OutboundProtocol,
+            Self::OutboundOpenInfo,
+            Self::OutEvent,
+            Self::Error,
+        >,
     > {
         if let Some(evt) = self.events.pop_front() {
-            return Poll::Ready(ProtocolsHandlerEvent::Custom(evt))
+            return Poll::Ready(ProtocolsHandlerEvent::Custom(evt));
         }
         if let Some(msg) = self.outgoing.pop_front() {
-            return Poll::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest{protocol: SubstreamProtocol::new(msg, ())})
+            return Poll::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                protocol: SubstreamProtocol::new(msg, ()),
+            });
         }
         Poll::Pending
     }
