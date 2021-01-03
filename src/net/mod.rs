@@ -461,7 +461,7 @@ impl OurNetwork {
         self.pubsub
             .publish(&self.topic, msg)
             .map_err(|e| Error::msg(format!("Publish error{:?}", e)))?;
-        self.outputs.aprintln(output_id, "Message published").await;
+        self.outputs.println(output_id, "Message published");
         Ok(())
     }
 
@@ -485,9 +485,7 @@ impl OurNetwork {
     {
         let key = Key::new(&key);
         self.kad.stop_providing(&key);
-        self.outputs
-            .aprintln(output_id, "Stopped providing key")
-            .await;
+        self.outputs.println(output_id, "Stopped providing key");
     }
 
     pub async fn get_providers<K>(&mut self, key: K, output_id: OutputId) -> bool

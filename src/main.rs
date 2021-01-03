@@ -33,8 +33,7 @@ async fn handle_input_checked(
 ) {
     if let Err(e) = handle_input(swarm, line, output_id, &mut out).await {
         error!("Input error: {}", e);
-        out.aprintln(output_id, format!("Command failed : {}", e))
-            .await;
+        out.println(output_id, format!("Command failed : {}", e));
     }
 }
 
@@ -46,7 +45,7 @@ async fn handle_input(
 ) -> Result<()> {
     macro_rules! outln {
         ($($p:expr),+) => {
-            out.aprintln(output_id, format!($($p),+)).await
+            out.println(output_id, format!($($p),+))
         }
     }
     let mut items = line.split(' ').filter(|s| !s.is_empty());

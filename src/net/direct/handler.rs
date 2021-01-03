@@ -1,15 +1,14 @@
-use std::{
-    collections::VecDeque,
-    fmt::{Debug, Display},
-    task::Poll,
-};
+use std::{collections::VecDeque, fmt::{Debug, Display}, task::Poll, time::Duration};
 
 use libp2p::swarm::{
     KeepAlive, ProtocolsHandler, ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol,
 };
 
 use super::protocol::{DirectProtocolReceive, DirectProtocolSend, Message};
-use crate::error::Error as CrateError;
+use crate::{error::Error as CrateError, };
+
+const TIMEOUT: u64 = 10; // outbound timeout in secs
+const QUEUE_SIZE: usize = 100; // max capacity of queue 
 
 pub type Error = DirectError<CrateError>;
 #[derive(Debug)]
@@ -39,6 +38,8 @@ pub enum DirectHandlerEvent {
 pub struct DirectHandler {
     events: VecDeque<DirectHandlerEvent>,
     outgoing: VecDeque<DirectProtocolSend>,
+    keep_alive: KeepAlive,
+    num_outgoing: usize
 }
 
 impl DirectHandler {
@@ -46,6 +47,17 @@ impl DirectHandler {
         DirectHandler {
             events: VecDeque::new(),
             outgoing: VecDeque::new(),
+            keep_alive: KeepAlive::No,
+            num_outgoing: 0,
+        }
+    }
+
+    fn got_outbound(&mut self) {
+        debug_assert!(self.num_outgoing>0);
+        self.num_outgoing = self.num_outgoing.saturating_sub(1);
+        // we do not have any outbound substream requests so connection is safe to close 
+        if self.num_outgoing == 0 && self.outgoing.len() == 0 {
+            self.keep_alive = KeepAlive::No
         }
     }
 }
@@ -74,10 +86,13 @@ impl ProtocolsHandler for DirectHandler {
     }
 
     fn inject_fully_negotiated_outbound(&mut self, _protocol: (), _info: Self::OutboundOpenInfo) {
+        self.got_outbound();
         self.events.push_back(DirectHandlerEvent::MessageSent);
     }
 
     fn inject_event(&mut self, msg: DirectProtocolSend) {
+       self.keep_alive = KeepAlive::Yes;
+       self.num_outgoing += 1;
         self.outgoing.push_back(msg);
     }
 
@@ -86,6 +101,7 @@ impl ProtocolsHandler for DirectHandler {
         _info: Self::OutboundOpenInfo,
         error: ProtocolsHandlerUpgrErr<crate::error::Error>,
     ) {
+        self.got_outbound();
         match error {
             ProtocolsHandlerUpgrErr::Timeout => self.events.push_back(DirectHandlerEvent::Timeout),
             ProtocolsHandlerUpgrErr::Timer => self
@@ -98,7 +114,7 @@ impl ProtocolsHandler for DirectHandler {
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
-        KeepAlive::No
+        self.keep_alive
     }
 
     fn poll(
@@ -113,11 +129,18 @@ impl ProtocolsHandler for DirectHandler {
         >,
     > {
         if let Some(evt) = self.events.pop_front() {
+            if self.events.capacity() > QUEUE_SIZE {
+                self.events.shrink_to_fit()
+            }
             return Poll::Ready(ProtocolsHandlerEvent::Custom(evt));
+
         }
         if let Some(msg) = self.outgoing.pop_front() {
+            if self.outgoing.capacity() > QUEUE_SIZE {
+                self.outgoing.shrink_to_fit();
+            }
             return Poll::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(msg, ()),
+                protocol: SubstreamProtocol::new(msg, ()).with_timeout(Duration::from_secs(TIMEOUT)),
             });
         }
         Poll::Pending

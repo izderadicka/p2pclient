@@ -5,14 +5,23 @@ use async_std::{
     sync::{Mutex, RwLock},
     task,
 };
+use channel::Sender;
 use error::Result;
-use futures::prelude::*;
+use futures::{future::Either, prelude::*};
 use libp2p::{kad::QueryId, request_response::RequestId};
-use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::error;
 
 const INPUT_CHANNEL_SIZE: usize = 1024;
+const OUTPUT_CHANNEL_SIZE: usize = 1024;
+const PENDING_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pending {
@@ -32,6 +41,12 @@ impl From<RequestId> for Pending {
     }
 }
 
+enum OutputMsg {
+    One { msg: String, output: OutputId },
+    All { msg: String },
+    Reply { msg: String, pending: Pending },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct OutputId(u64);
 
@@ -47,12 +62,13 @@ pub type Cmd = (String, OutputId);
 struct OutputsInner {
     outputs: HashMap<OutputId, Mutex<Output>>,
     counter: u64,
-    pending: HashMap<Pending, OutputId>,
+    pending: HashMap<Pending, (OutputId, Instant)>,
 }
 
 #[derive(Clone)]
 pub struct OutputSwitch {
     inner: Arc<RwLock<OutputsInner>>,
+    sender: Sender<OutputMsg>,
 }
 
 macro_rules! write_msg {
@@ -70,14 +86,11 @@ macro_rules! write_msg {
 }
 
 impl OutputSwitch {
-    pub fn println<S: Into<String>>(&self, for_input: OutputId, msg: S) {
-        let s: String = msg.into() + "\n";
-        let out = self.inner.clone();
-        task::spawn(async move {
-            if let Some(output) = out.read().await.outputs.get(&for_input) {
-                write_msg!(output, s);
-            }
-        });
+    pub fn println<S: Into<String>>(&self, output: OutputId, msg: S) {
+        let msg: String = msg.into() + "\n";
+        if let Err(e) = self.sender.try_send(OutputMsg::One { msg, output }) {
+            error!("Output send error {}", e);
+        }
     }
 
     pub fn reply<S, P>(&self, for_pending: P, msg: S)
@@ -85,38 +98,17 @@ impl OutputSwitch {
         S: Into<String>,
         P: Into<Pending> + Debug,
     {
-        let s: String = msg.into() + "\n";
-        let out = self.inner.clone();
-        let for_pending = for_pending.into();
-        task::spawn(async move {
-            let mut out = out.write().await;
-
-            if let Some(output_id) = out.pending.remove(&for_pending) {
-                if let Some(output) = out.outputs.get(&output_id) {
-                    write_msg!(output, s);
-                }
-            } else {
-                error!("Pending {:?} was not registered for output", for_pending);
-            }
-        });
+        let msg: String = msg.into() + "\n";
+        let pending = for_pending.into();
+        if let Err(e) = self.sender.try_send(OutputMsg::Reply { msg, pending }) {
+            error!("Output send error {}", e);
+        }
     }
 
     pub fn send_to_all(&self, msg: impl Into<String>) {
         let msg: String = msg.into() + "\n";
-        let out = self.inner.clone();
-        task::spawn(async move {
-            for output in out.read().await.outputs.values() {
-                let s = msg.as_str();
-                write_msg!(output, s);
-            }
-        });
-    }
-
-    pub async fn aprintln<S: Into<String>>(&self, for_input: OutputId, text: S) {
-        let s: String = text.into() + "\n";
-
-        if let Some(output) = self.inner.read().await.outputs.get(&for_input) {
-            write_msg!(output, s);
+        if let Err(e) = self.sender.try_send(OutputMsg::All { msg }) {
+            error!("Output send error {}", e);
         }
     }
 
@@ -138,7 +130,7 @@ impl OutputSwitch {
             .write()
             .await
             .pending
-            .insert(pending_id.into(), output_id)
+            .insert(pending_id.into(), (output_id, Instant::now()))
             .is_some()
         {
             error!("For same id previous record was pending")
@@ -195,13 +187,61 @@ impl InputOutputSwitch {
             task::spawn(async move { input_loop!(input, sender, output_id) });
         }
 
+        let (output_sender, mut output_receiver) = channel::bounded(OUTPUT_CHANNEL_SIZE);
+
         let outputs = OutputSwitch {
             inner: Arc::new(RwLock::new(OutputsInner {
                 outputs,
                 counter: 0,
                 pending: HashMap::new(),
             })),
+            sender: output_sender,
         };
+
+        let out = outputs.clone();
+        task::spawn(async move {
+            let mut timeout_check =
+                async_std::stream::interval(Duration::from_secs(PENDING_TIMEOUT_SECS));
+
+            loop {
+                match future::select(output_receiver.next(), timeout_check.next()).await {
+                    Either::Left((None, _)) => break,
+                    Either::Left((Some(msg), _)) => match msg {
+                        OutputMsg::One { msg, output } => {
+                            if let Some(output) = out.inner.read().await.outputs.get(&output) {
+                                write_msg!(output, msg);
+                            }
+                        }
+                        OutputMsg::All { msg } => {
+                            let msg = msg.as_str();
+                            for output in out.inner.read().await.outputs.values() {
+                                write_msg!(output, msg);
+                            }
+                        }
+                        OutputMsg::Reply { msg, pending } => {
+                            let mut out = out.inner.write().await;
+
+                            if let Some((output_id, _)) = out.pending.remove(&pending) {
+                                if let Some(output) = out.outputs.get(&output_id) {
+                                    write_msg!(output, msg);
+                                }
+                            } else {
+                                error!("Pending {:?} was not registered for output", pending);
+                            }
+                        }
+                    },
+                    Either::Right((_, _)) => {
+                        debug!("Pending outputs cleanup");
+                        let mut out = out.inner.write().await;
+                        let now = Instant::now();
+                        out.pending.retain(|_, (_, created)| {
+                            now.duration_since(*created).as_secs() < PENDING_TIMEOUT_SECS
+                        });
+                    }
+                }
+            }
+            error!("Output loop ended prematurely")
+        });
 
         // Listens on control TCP socket and forwards commands to control channel
         if let Some(addr) = control_socket {
